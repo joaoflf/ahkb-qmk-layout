@@ -3,7 +3,6 @@
 #   include "keymap.h"
 #endif
 
-
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     /* Layer 0: Base Layout */
     [0] = LAYOUT_ferris_hlc(
@@ -44,7 +43,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     /* Layer 3: F-Keys */
     [3] = LAYOUT_ferris_hlc(
         // Left hand
-        RM_TOGG, RM_NEXT, KC_NO,    RM_SATU,    RM_SATD,                           KC_NO,    KC_NO,    KC_NO,    KC_NO,    KC_NO,
+        RM_TOGG, RM_NEXT, RM_PREV,  RM_SATU,    RM_SATD,                              RM_HUEU,    RM_HUED,    RM_VALU,    RM_VALD,    RM_SPDU,
         OSM(MOD_LSFT), OSM(MOD_LCTL), OSM(MOD_LALT), OSM(MOD_LGUI), KC_F11,         KC_F12, OSM(MOD_RGUI), OSM(MOD_RALT), OSM(MOD_RCTL), OSM(MOD_RSFT),
         KC_F1,   KC_F2,   KC_F3,   KC_F4,   KC_F5,                                  KC_F6,   KC_F7,   KC_F8,   KC_F9,   KC_F10,
                                         KC_NO, KC_LSFT,                       KC_SPC, KC_NO,
