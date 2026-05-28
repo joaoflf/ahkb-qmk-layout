@@ -55,11 +55,179 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 };
 
 
-void post_process_record_user(uint16_t keycode, keyrecord_t *record) {
-    if (IS_QK_ONE_SHOT_MOD(keycode) && is_oneshot_layer_active() && record->event.pressed) {
-        clear_oneshot_layer_state(ONESHOT_OTHER_KEY_PRESSED);
+// --- One-shot layer / mod chain handling ---------------------------------
+// Goals:
+//   * Cmd+S    (tap mode):  OSL(1) → tap F → tap S            → Cmd+S
+//   * Cmd+L    (tap mode):  OSL(1) → tap F → tap L            → Cmd+L (no wait)
+//   * Cmd+1    (tap mode):  OSL(1) → tap F → tap 1            → Cmd+1 (no wait)
+//   * Cmd+Alt+V (hold chord): OSL(2) → hold J + K → press V   → Cmd+Alt+V
+//
+// Three pieces work together:
+//
+//   1. Counter + deferred OSL clear: while any OSM is held the OSL stays
+//      alive; once everyone is released we arm a short fallback timer so
+//      that *eventually* the OSL retires even if nothing else happens.
+//
+//   2. pre_process_record_user re-resolve: fires the instant a non-OSM
+//      key is pressed while the OSL is still alive AND it's either a
+//      held chord (OSMs currently down) or the post-tap chain window is
+//      armed. Substitutes the base-layer keycode in place when the
+//      layer-N keycode is something the user clearly didn't intend
+//      (arrows/media/punctuation), and leaves it alone otherwise
+//      (digits/letters/symbols/ENT/ESC/TAB/SPC/BSPC).
+//
+//   3. HOLD_ON_OTHER_KEY_PRESS_PER_KEY for right-hand OSMs only: lets a
+//      held J→K→V chord register the modifiers as held mods immediately
+//      instead of waiting for the tap term.
+#define OSL_CHAIN_WINDOW_MS 100
+
+// Layer 2 is the "chord with base-layer letters" launcher: any key
+// pressed during a chord on this layer re-resolves to the base-layer
+// letter (Cmd+L, Cmd+V, etc.). Other layers (e.g. layer 1) preserve
+// their own keycodes so Cmd+Left, Cmd+1, Cmd+PgDn keep working.
+#define OSL_CHORD_LAYER 2
+
+static uint8_t  held_osms       = 0;
+static bool     osl_clear_armed = false;
+static uint32_t osl_clear_start = 0;
+
+// Position-keyed table of "we substituted the base-layer keycode for this
+// key; remember it so the release event can unregister the right keycode".
+// 0 means "no substitution". MATRIX_ROWS/MATRIX_COLS come from the keyboard.
+static uint16_t remap_keycode[MATRIX_ROWS][MATRIX_COLS] = {{0}};
+
+// Force right-hand OSMs to settle as a hold the moment another key is
+// pressed during their tap window, BUT ONLY when at least one other OSM
+// is already held. Rationale:
+//   * Single mod + letter (J then L): we want J to stay in its tap window
+//     so it becomes a sticky LGUI; that arms our tap-mode re-resolve so
+//     L can be substituted for the letter at its position.
+//   * Multi-mod chord (J + K + V): the *second* held mod (K) needs to
+//     settle quickly so its modifier is registered when V arrives.
+// Left-hand OSMs keep the default tap-vs-hold behavior.
+bool get_hold_on_other_key_press(uint16_t keycode, keyrecord_t *record) {
+    if (IS_QK_ONE_SHOT_MOD(keycode)) {
+        if (QK_ONE_SHOT_MOD_GET_MODS(keycode) & 0x10) {
+            return held_osms > 0;
+        }
     }
-    return;
+    return false;
+}
+
+// Decide whether `kc` (the layer-N keycode at this position) should be
+// silently replaced with `base` (the layer-0 keycode) when a chord/chain
+// re-resolve is taking place.
+//
+// Rule of thumb:
+//   * OSMs anywhere → re-resolve to the base letter (Cmd+S from
+//     layer 1's OSM(LCTL), Cmd+L from layer 2's OSM(RCTL)).
+//   * Anything else on the *chord layer* (layer 2) → re-resolve. This
+//     gives you Cmd+V from KC_QUOT and Cmd+R from LSFT(KC_9). Trade-off:
+//     Cmd+@ via held-J + C also re-resolves to Cmd+C.
+//   * Anything else on *other layers* (e.g. layer 1) → pass through.
+//     This preserves Cmd+Left (KC_LEFT), Cmd+1 (KC_1), Cmd+PgDn, etc.
+//   * Letters/digits/ENT/ESC/TAB/SPC/BSPC always pass through.
+static bool should_reresolve_to_base(uint16_t kc, uint16_t base) {
+    if (base < KC_A || base > KC_Z) return false;
+    if (IS_QK_ONE_SHOT_MOD(kc)) return true;
+    if (kc >= KC_A && kc <= KC_Z) return false;
+    if (kc >= KC_1 && kc <= KC_0) return false;
+    if (kc == KC_ENT || kc == KC_ESC || kc == KC_BSPC
+        || kc == KC_TAB || kc == KC_SPC) return false;
+    return get_oneshot_layer() == OSL_CHORD_LAYER;
+}
+
+static bool try_reresolve(uint16_t keycode, keyrecord_t *record) {
+    const uint8_t row = record->event.key.row;
+    const uint8_t col = record->event.key.col;
+    uint16_t base_keycode = keymap_key_to_keycode(0, record->event.key);
+    if (!should_reresolve_to_base(keycode, base_keycode)) return false;
+
+    clear_oneshot_layer_state(ONESHOT_PRESSED | ONESHOT_OTHER_KEY_PRESSED);
+    osl_clear_armed = false;
+    register_code16(base_keycode);
+    remap_keycode[row][col] = base_keycode;
+    return true;
+}
+
+// We re-resolve in process_record_user (not pre_process) because:
+//   * For held chords, pre_process fires on the chord-final key's raw
+//     press before action_tapping has settled the held OSMs, so the
+//     counter is still 0 and the chord path can't trigger.
+//     process_record_user runs after tap-detect has settled the OSMs.
+//   * Non-tap-record keys flow through process_record_user essentially
+//     immediately on press anyway.
+//
+// Cases handled here:
+//   CASE 1: Tap mode — only the first mod was tapped (osl_clear_armed,
+//           counter == 0). Try to re-resolve; should_reresolve_to_base
+//           decides per layer what passes through (Cmd+Left, Cmd+1) vs.
+//           what becomes a base letter (Cmd+S, Cmd+L).
+//   CASE 2: Held chord — at least one OSM is physically held. Re-resolve
+//           by default, but treat OSMs on the chord layer that settled
+//           as HOLDs (tap.count == 0) as chord members so they keep
+//           their modifier role — that's how Cmd+Alt+V's K registers as
+//           RALT instead of being substituted for letter K. OSMs that
+//           settled as TAPs (tap.count == 1) and OSMs on non-chord
+//           layers still re-resolve to their base letter.
+bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (!IS_KEYEVENT(record->event)) return true;
+
+    const uint8_t row = record->event.key.row;
+    const uint8_t col = record->event.key.col;
+    if (row >= MATRIX_ROWS || col >= MATRIX_COLS) return true;
+
+    if (record->event.pressed) {
+        if (!is_oneshot_layer_active()) return true;
+
+        // CASE 1: tap-mode chain window, no mods currently held
+        if (osl_clear_armed && held_osms == 0) {
+            if (try_reresolve(keycode, record)) return false;
+        }
+
+        // CASE 2: held chord
+        if (held_osms > 0) {
+            bool is_osm = IS_QK_ONE_SHOT_MOD(keycode);
+            bool is_chord_member = is_osm
+                                && get_oneshot_layer() == OSL_CHORD_LAYER
+                                && record->tap.count == 0;
+            if (!is_chord_member) {
+                if (try_reresolve(keycode, record)) return false;
+            }
+        }
+    } else {
+        if (remap_keycode[row][col] != 0) {
+            unregister_code16(remap_keycode[row][col]);
+            remap_keycode[row][col] = 0;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void post_process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (!IS_QK_ONE_SHOT_MOD(keycode)) return;
+
+    if (record->event.pressed) {
+        held_osms++;
+        osl_clear_armed = false;
+    } else {
+        if (held_osms > 0) held_osms--;
+        if (held_osms == 0 && is_oneshot_layer_active()) {
+            osl_clear_armed = true;
+            osl_clear_start = timer_read32();
+        }
+    }
+}
+
+void matrix_scan_user(void) {
+    if (osl_clear_armed && timer_elapsed32(osl_clear_start) >= OSL_CHAIN_WINDOW_MS) {
+        osl_clear_armed = false;
+        if (held_osms == 0 && is_oneshot_layer_active()) {
+            clear_oneshot_layer_state(ONESHOT_OTHER_KEY_PRESSED);
+        }
+    }
 }
 
 
