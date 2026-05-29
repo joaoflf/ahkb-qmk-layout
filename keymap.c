@@ -122,18 +122,20 @@ bool get_hold_on_other_key_press(uint16_t keycode, keyrecord_t *record) {
 //   * OSMs anywhere → re-resolve to the base letter (Cmd+S from
 //     layer 1's OSM(LCTL), Cmd+L from layer 2's OSM(RCTL)).
 //   * Anything else on the *chord layer* (layer 2) → re-resolve. This
-//     gives you Cmd+V from KC_QUOT and Cmd+R from LSFT(KC_9). Trade-off:
-//     Cmd+@ via held-J + C also re-resolves to Cmd+C.
+//     gives you Cmd+V from KC_QUOT, Cmd+R from LSFT(KC_9), Cmd+Q from
+//     KC_ESC, etc. Trade-off: Cmd+@ via held-J + C also re-resolves to
+//     Cmd+C, and Cmd+ESC via Q on layer 2 becomes Cmd+Q.
 //   * Anything else on *other layers* (e.g. layer 1) → pass through.
-//     This preserves Cmd+Left (KC_LEFT), Cmd+1 (KC_1), Cmd+PgDn, etc.
-//   * Letters/digits/ENT/ESC/TAB/SPC/BSPC always pass through.
+//     This preserves Cmd+Left (KC_LEFT), Cmd+1 (KC_1), Cmd+Enter,
+//     Cmd+Tab, Cmd+BSPC etc. — they're all on layer 1 in this map.
+//   * Letters and digits always pass through; basic-key positions that
+//     resolve to non-letter base codes (KC_SCLN, KC_COMM, etc.) are
+//     also left alone because they can't become a letter.
 static bool should_reresolve_to_base(uint16_t kc, uint16_t base) {
     if (base < KC_A || base > KC_Z) return false;
     if (IS_QK_ONE_SHOT_MOD(kc)) return true;
     if (kc >= KC_A && kc <= KC_Z) return false;
     if (kc >= KC_1 && kc <= KC_0) return false;
-    if (kc == KC_ENT || kc == KC_ESC || kc == KC_BSPC
-        || kc == KC_TAB || kc == KC_SPC) return false;
     return get_oneshot_layer() == OSL_CHORD_LAYER;
 }
 
